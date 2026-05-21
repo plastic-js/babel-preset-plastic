@@ -1,0 +1,59 @@
+{
+  "name": "babel-preset-plastic",
+  "version": "0.1.1",
+  "description": "Babel preset that transforms JSX into Plastic's reactive runtime calls (control-flow lifting + mergeProps rewrite).",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./control-flow": "./babel-plugin-transform-jsx-control-flow.js",
+    "./reactive": "./babel-plugin-transform-jsx-reactive.js"
+  },
+  "files": [
+    "index.js",
+    "babel-plugin-transform-jsx-control-flow.js",
+    "babel-plugin-transform-jsx-reactive.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "babel",
+    "babel-preset",
+    "babel-plugin",
+    "jsx",
+    "plastic",
+    "reactive",
+    "signals"
+  ],
+  "scripts": {
+    "test": "vitest run"
+  },
+  "author": "plas",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/plastic-js/babel-preset-plastic.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@babel/core": "^7.0.0",
+    "@babel/preset-react": "^7.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@babel/preset-react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.0",
+    "@babel/preset-react": "^7.28.5",
+    "@plastic-js/plastic": "^1.0.0",
+    "jsdom": "^29.1.1",
+    "vitest": "^4.1.7"
+  }
+}
