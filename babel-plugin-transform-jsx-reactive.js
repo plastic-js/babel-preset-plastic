@@ -269,6 +269,71 @@ const plugin = function(babel){
 		return attr.value
 	}
 
+	// "Literal-static" classifies an attribute value tightly enough that the
+	// runtime can apply it without any reactive-binding machinery: string /
+	// numeric / boolean / null literal, or a JSXExpressionContainer wrapping
+	// one of those (or a boolean-shorthand attribute with no value).
+	// Identifiers do NOT qualify — they can point to a reactive tree proxy.
+	const isLiteralStaticAttrValue = (attr)=> {
+		if (attr.value == null){
+			return true
+		}
+		if (t.isStringLiteral(attr.value)){
+			return true
+		}
+		if (t.isJSXExpressionContainer(attr.value)){
+			const expr = attr.value.expression
+			return t.isStringLiteral(expr)
+				|| t.isNumericLiteral(expr)
+				|| t.isBooleanLiteral(expr)
+				|| t.isNullLiteral(expr)
+		}
+		return false
+	}
+
+	// An element qualifies for the jsxStatic fast path when its tag is an
+	// intrinsic DOM tag, it has no spread attributes, and every attribute
+	// value is a literal. Children are not constrained — they go through the
+	// normal reactive path as a separate argument.
+	const canEmitJsxStatic = (openingName, jsxAttrs)=> {
+		if (!t.isJSXIdentifier(openingName) || !(/^[a-z]/).test(openingName.name)){
+			return false
+		}
+		for (const attr of jsxAttrs){
+			if (t.isJSXSpreadAttribute(attr)){
+				return false
+			}
+			if (!isLiteralStaticAttrValue(attr)){
+				return false
+			}
+		}
+		return true
+	}
+
+	// Build a plain object literal of literal-static attrs. No duplicate
+	// tolerance needed here for class/style merging because the static path
+	// rejects any element whose attrs require runtime merge semantics; but we
+	// still enforce duplicate-attr detection consistent with the reactive
+	// path.
+	const buildStaticPropsObject = (jsxAttrs, parentTagName, file)=> {
+		const seenNames = new Map()
+		const properties = []
+		for (const attr of jsxAttrs){
+			const { key, name } = jsxNameToKey(attr.name)
+			if (!DUPLICATE_ALLOWED_ATTRS.has(name)){
+				if (seenNames.has(name)){
+					const filename = file?.opts?.filename ?? '<unknown>'
+					const loc = attr.loc?.start
+					const where = loc ? `${filename}:${loc.line}:${loc.column}` : filename
+					throw new Error(`[transform-jsx-reactive] duplicate attribute "${name}" on <${parentTagName ?? '?'}> at ${where}`)
+				}
+				seenNames.set(name, true)
+			}
+			properties.push(t.objectProperty(key, jsxAttrValueToExpression(attr)))
+		}
+		return t.objectExpression(properties)
+	}
+
 	// Attribute names that are allowed to appear more than once on the same
 	// element — `mergeProps` has dedicated merge rules for class/style, so
 	// duplicates are intentional usage, not author error.
@@ -370,6 +435,386 @@ const plugin = function(babel){
 			}
 			return buildObjectExpression(group.attrs, group.syntheticChildren, parentTagName, file, seenNames)
 		})
+	}
+
+	// ---------------------------------------------------------------------------
+	// Compile-time DOM template fast path
+	//
+	// A JSX subtree that contains nothing but intrinsic tags, literal attribute
+	// values, and literal children can be serialized to an HTML string at build
+	// time. The runtime parses that string once per module into a detached
+	// <template> node; each render site emits `_tmpl.cloneNode(true)` and skips
+	// jsx/mergeProps/applyProps entirely.
+	// ---------------------------------------------------------------------------
+
+	const VOID_ELEMENTS = new Set([
+		'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+		'link', 'meta', 'source', 'track', 'wbr',
+	])
+
+	const jsxAttrNameToHtml = (name)=> {
+		if (name === 'className'){
+			return 'class'
+		}
+		if (name === 'htmlFor'){
+			return 'for'
+		}
+		return name
+	}
+
+	const escapeAttrValue = (value)=> String(value)
+		.replace(/&/g, '&amp;')
+		.replace(/"/g, '&quot;')
+
+	const escapeText = (value)=> String(value)
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+
+	const isStaticLiteralNode = (node)=> {
+		if (!node){
+			return true
+		}
+		return t.isStringLiteral(node)
+			|| t.isNumericLiteral(node)
+			|| t.isBooleanLiteral(node)
+			|| t.isNullLiteral(node)
+	}
+
+	const literalNodeToValue = (node)=> {
+		if (!node){
+			return true
+		}
+		if (t.isNullLiteral(node)){
+			return null
+		}
+		return node.value
+	}
+
+	// "Foldable" = this element can have its skeleton serialized into HTML.
+	// Requires intrinsic tag, no spread attrs, and non-namespaced attr names.
+	// Attribute values and children may be arbitrary (literals fold into HTML,
+	// dynamics become setProp/insert holes). Non-foldable children (components,
+	// fragments, spread children, foldable-violating intrinsics) become insert
+	// holes too — they get re-visited by babel inside the accessor body.
+	const isFoldableElement = (node)=> {
+		if (!t.isJSXElement(node)){
+			return false
+		}
+		const opening = node.openingElement
+		if (!t.isJSXIdentifier(opening.name)){
+			return false
+		}
+		if (!(/^[a-z]/).test(opening.name.name)){
+			return false
+		}
+		for (const attr of opening.attributes){
+			if (!t.isJSXAttribute(attr)){
+				return false
+			}
+			if (!t.isJSXIdentifier(attr.name)){
+				return false
+			}
+		}
+		return true
+	}
+
+	// Compile a foldable JSXElement into a plan describing:
+	//   - a tree of "compiled nodes" mirroring the DOM the template will create
+	//   - a list of ops (setProp / insert) to run on the cloned tree
+	// Pure-static subtrees produce zero ops, so the caller can emit just
+	// `tmpl.cloneNode(true)` without the IIFE wrapper.
+	const compileTemplatePlan = (rootJsx)=> {
+		const ops = []
+
+		const compileElement = (jsxEl, parent, indexInParent)=> {
+			const tag = jsxEl.openingElement.name.name
+			const node = {
+				kind: 'element',
+				tag,
+				parent,
+				indexInParent,
+				staticAttrs: [],
+				dynamicAttrs: [],
+				children: [],
+				needsLocal: false,
+				localName: null,
+			}
+
+			for (const attr of jsxEl.openingElement.attributes){
+				const jsName = attr.name.name
+				const htmlName = jsxAttrNameToHtml(jsName)
+
+				if (attr.value == null){
+					node.staticAttrs.push({ name: htmlName, value: true })
+					continue
+				}
+				if (t.isStringLiteral(attr.value)){
+					node.staticAttrs.push({ name: htmlName, value: attr.value.value })
+					continue
+				}
+				if (t.isJSXExpressionContainer(attr.value)){
+					const expr = attr.value.expression
+					if (t.isJSXEmptyExpression(expr)){
+						continue
+					}
+					if (isStaticLiteralNode(expr)){
+						const v = literalNodeToValue(expr)
+						if (v === false || v == null){
+							continue
+						}
+						node.staticAttrs.push({ name: htmlName, value: v })
+						continue
+					}
+					node.dynamicAttrs.push({ key: jsName, expr })
+					continue
+				}
+				// JSXElement / JSXFragment as attribute value — treat as dynamic.
+				node.dynamicAttrs.push({ key: jsName, expr: attr.value })
+			}
+
+			// Children: filter whitespace-only, then classify each.
+			const meaningful = jsxEl.children.filter(child=> isMeaningfulChild(child, tag))
+			const singleChild = meaningful.length === 1
+
+			let domIdx = 0
+			for (const child of meaningful){
+				if (t.isJSXText(child)){
+					const raw = WHITESPACE_SENSITIVE_TAGS.has(tag) ? child.value : normalizeJsxText(child.value)
+					node.children.push({
+						kind: 'text',
+						text: raw,
+						parent: node,
+						indexInParent: domIdx,
+						children: [],
+						needsLocal: false,
+						localName: null,
+					})
+					domIdx += 1
+					continue
+				}
+				if (t.isJSXExpressionContainer(child)){
+					const expr = child.expression
+					if (t.isJSXEmptyExpression(expr)){
+						continue
+					}
+					if (isStaticLiteralNode(expr)){
+						const v = literalNodeToValue(expr)
+						// null / true / false render to nothing in HTML.
+						if (v == null || v === false || v === true){
+							continue
+						}
+						node.children.push({
+							kind: 'text',
+							text: String(v),
+							parent: node,
+							indexInParent: domIdx,
+							children: [],
+							needsLocal: false,
+							localName: null,
+						})
+						domIdx += 1
+						continue
+					}
+					// Dynamic child hole.
+					if (singleChild){
+						ops.push({ kind: 'insert', parentNode: node, markerNode: null, expr })
+						continue
+					}
+					const markerNode = {
+						kind: 'marker',
+						parent: node,
+						indexInParent: domIdx,
+						children: [],
+						needsLocal: false,
+						localName: null,
+					}
+					node.children.push(markerNode)
+					ops.push({ kind: 'insert', parentNode: node, markerNode, expr })
+					domIdx += 1
+					continue
+				}
+				if (t.isJSXElement(child) && isFoldableElement(child)){
+					const childNode = compileElement(child, node, domIdx)
+					node.children.push(childNode)
+					domIdx += 1
+					continue
+				}
+				// Non-foldable JSX child (component, fragment, spread child,
+				// nested element with spreads/namespaced attrs): treat as a
+				// dynamic insert hole. The JSXElement / JSXFragment node is
+				// placed verbatim into the accessor body; babel re-traverses
+				// the IIFE and processes it through the regular jsx/mergeProps
+				// path.
+				if (singleChild){
+					ops.push({ kind: 'insert', parentNode: node, markerNode: null, expr: child })
+					continue
+				}
+				const markerNode = {
+					kind: 'marker',
+					parent: node,
+					indexInParent: domIdx,
+					children: [],
+					needsLocal: false,
+					localName: null,
+				}
+				node.children.push(markerNode)
+				ops.push({ kind: 'insert', parentNode: node, markerNode, expr: child })
+				domIdx += 1
+			}
+
+			// Schedule setProp ops for this element's dynamic attrs.
+			for (const attr of node.dynamicAttrs){
+				ops.push({ kind: 'setProp', elNode: node, key: attr.key, expr: attr.expr })
+			}
+
+			return node
+		}
+
+		const compiledRoot = compileElement(rootJsx, null, 0)
+
+		// Mark which compiled nodes need a local binding in the IIFE.
+		compiledRoot.needsLocal = true
+		for (const op of ops){
+			if (op.kind === 'setProp'){
+				op.elNode.needsLocal = true
+				continue
+			}
+			if (op.kind === 'insert'){
+				op.parentNode.needsLocal = true
+				if (op.markerNode){
+					op.markerNode.needsLocal = true
+				}
+			}
+		}
+
+		return { root: compiledRoot, ops }
+	}
+
+	// Render the compiled tree to HTML. Markers emit a `<!>` comment, which
+	// the browser parses as an empty comment node — exactly the runtime
+	// anchor `insert(parent, accessor, marker)` needs.
+	const treeToHtml = (node)=> {
+		if (node.kind === 'text'){
+			return escapeText(node.text)
+		}
+		if (node.kind === 'marker'){
+			return '<!>'
+		}
+		// element
+		let html = `<${node.tag}`
+		for (const attr of node.staticAttrs){
+			if (attr.value === true){
+				html += ` ${attr.name}`
+				continue
+			}
+			html += ` ${attr.name}="${escapeAttrValue(attr.value)}"`
+		}
+		html += '>'
+		if (VOID_ELEMENTS.has(node.tag)){
+			return html
+		}
+		for (const child of node.children){
+			html += treeToHtml(child)
+		}
+		html += `</${node.tag}>`
+		return html
+	}
+
+	// Build a navigation expression from a "near" local (an ancestor that has
+	// its own local binding) down to `target`. The path is a sequence of
+	// child-indices; each index becomes `.firstChild` followed by N
+	// `.nextSibling`s.
+	const buildNavigationExpr = (ancestorLocalName, steps)=> {
+		let expr = t.identifier(ancestorLocalName)
+		for (const idx of steps){
+			expr = t.memberExpression(expr, t.identifier('firstChild'))
+			for (let i = 0; i < idx; i += 1){
+				expr = t.memberExpression(expr, t.identifier('nextSibling'))
+			}
+		}
+		return expr
+	}
+
+	// Walk up from `node` to its nearest already-locallized ancestor,
+	// collecting the child-index path. Returns { ancestor, steps[] }.
+	const pathFromNearestLocal = (node)=> {
+		const steps = []
+		let cur = node
+		while (cur.parent != null){
+			steps.unshift(cur.indexInParent)
+			cur = cur.parent
+			if (cur.needsLocal){
+				return { ancestor: cur, steps }
+			}
+		}
+		return { ancestor: cur, steps }
+	}
+
+	// Wrap a dynamic expression for use as a setProp/insert accessor. The
+	// runtime's setProp/insert only set up a binding effect when handed a
+	// function; non-function values take a static one-shot path. So unlike the
+	// mergeProps path (where the proxy's get-trap supplies reactivity), here
+	// identifiers must be wrapped too — otherwise a tree-proxy passed as
+	// `style={styles}` would never re-apply when its fields mutate. Literals
+	// and arrow/function expressions stay as-is: literals can't be reactive,
+	// and arrow/function values are typically event handlers / refs that the
+	// runtime needs to receive verbatim.
+	const accessorFor = (expr)=> {
+		const node = unwrapExpression(expr)
+		if (!node){
+			return expr
+		}
+		if (t.isStringLiteral(node)
+			|| t.isNumericLiteral(node)
+			|| t.isBooleanLiteral(node)
+			|| t.isNullLiteral(node)
+			|| t.isBigIntLiteral?.(node)
+			|| t.isRegExpLiteral?.(node)
+			|| t.isArrowFunctionExpression(node)
+			|| t.isFunctionExpression(node)){
+			return expr
+		}
+		return t.arrowFunctionExpression([], expr)
+	}
+
+	// Hoist a module-level `const _tmplN = template('...')` declaration,
+	// deduped by HTML string so identical subtrees share one template node.
+	const ensureTemplate = (path, html)=> {
+		const program = path.findParent(p=> p.isProgram()) ?? path.hub?.file?.path
+		const templateId = ensureRuntimeImport(path, 'template')
+
+		if (!program){
+			return t.callExpression(templateId, [t.stringLiteral(html)])
+		}
+
+		let cache = program.getData('templateCache')
+		if (!cache){
+			cache = new Map()
+			program.setData('templateCache', cache)
+		}
+		const cached = cache.get(html)
+		if (cached){
+			return t.identifier(cached)
+		}
+
+		const local = program.scope.generateUidIdentifier('tmpl')
+		const decl = t.variableDeclaration('const', [
+			t.variableDeclarator(local, t.callExpression(templateId, [t.stringLiteral(html)])),
+		])
+
+		const body = program.node.body
+		let insertIdx = 0
+		for (let i = 0; i < body.length; i += 1){
+			if (t.isImportDeclaration(body[i])){
+				insertIdx = i + 1
+				continue
+			}
+			break
+		}
+		body.splice(insertIdx, 0, decl)
+		cache.set(html, local.name)
+		return t.identifier(local.name)
 	}
 
 	const RUNTIME = '@plastic-js/plastic/jsx-runtime'
@@ -474,6 +919,154 @@ const plugin = function(babel){
 
 				const tagExpr = jsxTagToExpression(opening.name)
 				const parentTagName = t.isJSXIdentifier(opening.name) ? opening.name.name : null
+
+				// Template path: foldable intrinsic subtrees compile to an HTML
+				// template + per-hole setProp/insert calls. We only fire at the
+				// topmost foldable element; nested foldable children get folded
+				// into the parent's HTML during compileTemplatePlan. Pure-static
+				// subtrees (no dynamic holes) short-circuit to a bare
+				// `tmpl.cloneNode(true)` — no IIFE wrapper.
+				if (isFoldableElement(node)){
+					const parentPath = path.parentPath
+					const parentIsFoldable = parentPath
+						&& parentPath.isJSXElement()
+						&& isFoldableElement(parentPath.node)
+					if (!parentIsFoldable){
+						const plan = compileTemplatePlan(node)
+						const html = treeToHtml(plan.root)
+						const tmplId = ensureTemplate(path, html)
+
+						if (plan.ops.length === 0){
+							path.replaceWith(t.callExpression(
+								t.memberExpression(tmplId, t.identifier('cloneNode')),
+								[t.booleanLiteral(true)],
+							))
+							return
+						}
+
+						// Assign locals to needsLocal nodes in pre-order; emit
+						// declarations as we go so each declaration's RHS can
+						// reference its nearest already-declared ancestor.
+						const stmts = []
+						let counter = 0
+						const assignLocals = (cnode)=> {
+							if (cnode.needsLocal){
+								const name = `_el${counter}`
+								counter += 1
+								cnode.localName = name
+								if (cnode.parent == null){
+									stmts.push(t.variableDeclaration('const', [
+										t.variableDeclarator(
+											t.identifier(name),
+											t.callExpression(
+												t.memberExpression(tmplId, t.identifier('cloneNode')),
+												[t.booleanLiteral(true)],
+											),
+										),
+									]))
+								} else {
+									const { ancestor, steps } = pathFromNearestLocal(cnode)
+									stmts.push(t.variableDeclaration('const', [
+										t.variableDeclarator(
+											t.identifier(name),
+											buildNavigationExpr(ancestor.localName, steps),
+										),
+									]))
+								}
+							}
+							for (const child of cnode.children){
+								assignLocals(child)
+							}
+						}
+						assignLocals(plan.root)
+
+						const setPropId = ensureRuntimeImport(path, 'setProp')
+						const insertId = ensureRuntimeImport(path, 'insert')
+
+						for (const op of plan.ops){
+							if (op.kind === 'setProp'){
+								stmts.push(t.expressionStatement(
+									t.callExpression(setPropId, [
+										t.identifier(op.elNode.localName),
+										t.stringLiteral(op.key),
+										accessorFor(op.expr),
+									]),
+								))
+								continue
+							}
+							// insert
+							const args = [
+								t.identifier(op.parentNode.localName),
+								accessorFor(op.expr),
+							]
+							if (op.markerNode){
+								args.push(t.identifier(op.markerNode.localName))
+							}
+							stmts.push(t.expressionStatement(t.callExpression(insertId, args)))
+						}
+
+						stmts.push(t.returnStatement(t.identifier(plan.root.localName)))
+
+						// If any insert hole could render a component (uppercase JSX,
+						// member-expression tag, fragment, or arbitrary expression),
+						// the synchronous IIFE would call `_insert` under the caller's
+						// `currentOwner` — so a Provider sitting between this template
+						// and a descendant Consumer would be skipped by useContext's
+						// owner walk. Emit a thunk in that case and let the runtime
+						// invoke it while materializing the enclosing component, so
+						// component children land under the correct owner. Pure-DOM
+						// templates (only intrinsic inserts, setProps) are unaffected
+						// and keep the eager IIFE.
+						const isComponentInsertExpr = (expr)=> {
+							if (t.isJSXElement(expr)){
+								const name = expr.openingElement.name
+								if (t.isJSXIdentifier(name) && (/^[A-Z]/).test(name.name)){
+									return true
+								}
+								if (t.isJSXMemberExpression(name)){
+									return true
+								}
+								return false
+							}
+							if (t.isJSXFragment(expr)){
+								return true
+							}
+							return true
+						}
+						const needsThunk = plan.ops.some(op=> op.kind === 'insert' && isComponentInsertExpr(op.expr))
+
+						const factory = t.arrowFunctionExpression([], t.blockStatement(stmts))
+						if (needsThunk){
+							path.replaceWith(factory)
+							return
+						}
+						path.replaceWith(t.callExpression(factory, []))
+						return
+					}
+				}
+
+				// Fast path: intrinsic tag + all attrs are literal-static + no
+				// spread → emit jsxStatic(tag, propsLiteral, children?). The
+				// runtime applies props directly with no reactive checks. Children
+				// still flow through the normal jsx pipeline (they may themselves
+				// be reactive expressions or jsx() subtrees).
+				if (canEmitJsxStatic(opening.name, attrs)){
+					const propsExpr = buildStaticPropsObject(attrs, parentTagName, state?.file)
+					const meaningfulChildren = children.filter(child=> isMeaningfulChild(child, parentTagName))
+					const childExprs = meaningfulChildren
+						.map(child=> jsxChildToExpression(child, parentTagName))
+						.filter(Boolean)
+					const jsxStaticId = ensureRuntimeImport(path, 'jsxStatic')
+					const callArgs = [tagExpr, propsExpr]
+					if (childExprs.length === 1 && !t.isSpreadElement(childExprs[0])){
+						callArgs.push(childExprs[0])
+					} else if (childExprs.length > 0){
+						callArgs.push(t.arrayExpression(childExprs))
+					}
+					path.replaceWith(t.callExpression(jsxStaticId, callArgs))
+					return
+				}
+
 				const args = buildMergePropsArgs(attrs, children, parentTagName, state?.file)
 
 				// No attrs and no meaningful children → emit jsx(Tag, {}) directly.

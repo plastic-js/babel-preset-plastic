@@ -9,10 +9,14 @@ import {
 	Fragment,
 	createTree,
 	h,
+	insert,
 	isMergedProps,
 	jsx,
+	jsxStatic,
 	mergeProps,
 	renderApp,
+	setProp,
+	template,
 } from '@plastic-js/plastic/jsx-runtime'
 import transformReactivePlugin from './babel-plugin-transform-jsx-reactive.js'
 import transformControlFlowPlugin from './babel-plugin-transform-jsx-control-flow.js'
@@ -101,7 +105,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => flag() ?')
+		expect(code).toContain('() => flag() ?')
 	})
 
 	it('wraps member-expression children in a lazy factory function', ()=> {
@@ -124,10 +128,10 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => state.count')
+		expect(code).toContain('() => state.count')
 	})
 
-	it('emits dynamic intrinsic DOM attributes as getter properties on the mergeProps payload', ()=> {
+	it('emits dynamic intrinsic DOM attributes as setProp accessors on the cloned template', ()=> {
 		const source = `
 			const view = <div style={{ color: state.color }} title={state.title} />
 		`
@@ -147,13 +151,14 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('get style()')
+		// Foldable intrinsic → template path. Dynamic attrs become setProp(_el, key, () => expr).
+		expect(code).toContain('template("<div></div>")')
+		expect(code).toContain('setProp(_el0, "style", () => ({')
 		expect(code).toContain('color: state.color')
-		expect(code).toContain('get title()')
-		expect(code).toContain('return state.title')
+		expect(code).toContain('setProp(_el0, "title", () => state.title)')
 	})
 
-	it('emits dynamic component props and event handlers as getters; runtime resolves them at access', ()=> {
+	it('routes intrinsic to template (setProp) and component to mergeProps (getter)', ()=> {
 		const source = `
 			const view = <><Button label={state.label} /><button onClick={handlers.save} disabled={locked} /></>
 		`
@@ -173,18 +178,19 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		// component prop with dynamic MemberExpression — getter on mergeProps
+		// Component still goes through mergeProps — getter for the dynamic prop.
 		expect(code).toContain('get label()')
 		expect(code).toContain('return state.label')
-		// dynamic event handler — also a getter; runtime fetches it per-dispatch
-		expect(code).toContain('get onClick()')
-		expect(code).toContain('return handlers.save')
-		// static identifier on intrinsic element — emitted as plain property
-		expect(code).toContain('disabled: locked')
-		expect(code).not.toContain('get disabled()')
+		// Intrinsic <button> with mixed dynamic + identifier attrs now templates.
+		// Dynamic handler → setProp with arrow accessor.
+		expect(code).toContain('setProp(_el0, "onClick", () => handlers.save)')
+		// Identifier value gets wrapped in a thunk so setProp takes its binding-
+		// effect path — the runtime needs a function to track reactivity, since
+		// the template path has no mergeProps Proxy to do it on its behalf.
+		expect(code).toContain('setProp(_el0, "disabled", () => locked)')
 	})
 
-	it('wraps dynamic intrinsic event handler expressions as getters', ()=> {
+	it('emits a setProp accessor for a dynamic intrinsic event handler', ()=> {
 		const source = `
 			const view = <button onClick={flag() ? () => alert("A") : () => alert("B")}>Toggle</button>
 		`
@@ -204,8 +210,8 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('get onClick()')
-		expect(code).toContain('return flag() ?')
+		expect(code).toContain('template("<button>Toggle</button>")')
+		expect(code).toContain('setProp(_el0, "onClick", () => flag() ?')
 	})
 
 	it('does not wrap arrow-function or function-expression children', ()=> {
@@ -252,7 +258,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => count()')
+		expect(code).toContain('() => count()')
 	})
 
 	it('wraps identifier used as a call argument when parent expression is a call (fn(foo))', ()=> {
@@ -275,10 +281,10 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => fn(foo)')
+		expect(code).toContain('() => fn(foo)')
 	})
 
-	it('does not wrap standalone function-reference identifier children (fn)', ()=> {
+	it('wraps a standalone identifier child in a thunk so insert takes its binding-effect path', ()=> {
 		const source = `
 			const view = <div>{fn}</div>
 		`
@@ -298,8 +304,11 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: fn')
-		expect(code).not.toContain('children: () => fn')
+		// Template path: single dynamic child → no marker. Identifier wrapped
+		// in `() => fn` so the runtime's insert sets up a binding effect
+		// (the template path has no mergeProps Proxy to provide reactivity).
+		expect(code).toContain('template("<div></div>")')
+		expect(code).toContain('insert(_el0, () => fn)')
 	})
 
 	it('wraps optional-call children', ()=> {
@@ -322,7 +331,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => count?.()')
+		expect(code).toContain('() => count?.()')
 	})
 
 	it('wraps tagged-template-literal children', ()=> {
@@ -348,7 +357,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 		expect(code).toContain('() => t`Hello`')
 	})
 
-	it('wraps intrinsic attribute whose object value contains a spread element as a getter', ()=> {
+	it('emits an intrinsic attribute whose object value contains a spread element as a setProp accessor', ()=> {
 		const source = `
 			const view = <div style={{...styles}} />
 		`
@@ -368,7 +377,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('get style()')
+		expect(code).toContain('setProp(_el0, "style", () => ({')
 		expect(code).toContain('...styles')
 	})
 
@@ -392,7 +401,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () =>')
+		expect(code).toContain('() =>')
 	})
 
 	it('wraps a non-empty fragment used as a child expression', ()=> {
@@ -415,10 +424,10 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () =>')
+		expect(code).toContain('() =>')
 	})
 
-	it('does not wrap an empty fragment used as a child expression', ()=> {
+	it('wraps an empty fragment child in an accessor arrow (template path needs a function for the binding effect)', ()=> {
 		const source = `
 			const view = <div>{<></>}</div>
 		`
@@ -438,7 +447,10 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).not.toContain('children: () =>')
+		// The template path wraps any non-literal/non-arrow child in `() => …`
+		// so insert sets up its binding effect (the path has no mergeProps
+		// proxy to track reactive reads).
+		expect(code).toMatch(/insert\([^,]+,\s*\(\)\s*=>/)
 	})
 
 	it('emits a JSX element used as an attribute value as a getter and rewrites the inner element', ()=> {
@@ -534,7 +546,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => count++')
+		expect(code).toContain('() => count++')
 	})
 
 	it('wraps assignment-expression children (state.value = 1)', ()=> {
@@ -557,7 +569,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => state.value = 1')
+		expect(code).toContain('() => state.value = 1')
 	})
 
 	it('wraps logical-expression children when any operand is dynamic (flag() && value)', ()=> {
@@ -580,10 +592,10 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => flag() && value')
+		expect(code).toContain('() => flag() && value')
 	})
 
-	it('does not wrap logical-expression children when all operands are static identifiers (flag && value)', ()=> {
+	it('wraps logical-expression identifier children so the template path takes its reactive insert path', ()=> {
 		const source = `
 			const view = <div>{flag && value}</div>
 		`
@@ -603,7 +615,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).not.toContain('() => flag && value')
+		expect(code).toContain('() => flag && value')
 	})
 
 	it('wraps conditional-expression children when any branch is dynamic (a ? state.b : c)', ()=> {
@@ -626,10 +638,10 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => a ? state.b : c')
+		expect(code).toContain('() => a ? state.b : c')
 	})
 
-	it('does not wrap conditional-expression children when all branches are static identifiers (a ? b : c)', ()=> {
+	it('wraps conditional-expression identifier children so the template path takes its reactive insert path', ()=> {
 		const source = `
 			const view = <div>{a ? b : c}</div>
 		`
@@ -649,7 +661,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).not.toContain('() => a ? b : c')
+		expect(code).toContain('() => a ? b : c')
 	})
 
 	it('wraps binary-expression children when one member is dynamic (a() + b)', ()=> {
@@ -672,10 +684,10 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => a() + b')
+		expect(code).toContain('() => a() + b')
 	})
 
-	it('does not wrap binary-expression children when both members are static identifiers (foo + bar)', ()=> {
+	it('wraps binary-expression identifier children so the template path takes its reactive insert path', ()=> {
 		const source = `
 			const view = <div>{foo + bar}</div>
 		`
@@ -695,7 +707,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).not.toContain('children: () => foo + bar')
+		expect(code).toContain('() => foo + bar')
 	})
 
 	it('wraps unary-expression children when operand is dynamic (!x())', ()=> {
@@ -718,7 +730,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => !x()')
+		expect(code).toContain('() => !x()')
 	})
 
 	it('wraps array-expression children when one member is dynamic ([a(), 1])', ()=> {
@@ -741,7 +753,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => [a(), 1]')
+		expect(code).toContain('() => [a(), 1]')
 	})
 
 	it('wraps object-expression children when one value is dynamic ({ x: value() })', ()=> {
@@ -764,7 +776,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => ({')
+		expect(code).toContain('() => ({')
 		expect(code).toContain('x: value()')
 	})
 
@@ -786,7 +798,7 @@ describe('babel plugin: ternary lazy transform', ()=> {
 
 		const code = transformed?.code ?? ''
 
-		expect(code).toContain('children: () => `Hello ${name()}`')
+		expect(code).toContain('() => `Hello ${name()}`')
 	})
 })
 
@@ -844,11 +856,11 @@ const compileComponent = (source)=> {
 	})
 
 	const code = transformed?.code ?? ''
-	const factory = new Function('h', 'Fragment', 'jsx', 'mergeProps', 'Dynamic', `${code}; return App;`)
+	const factory = new Function('h', 'Fragment', 'jsx', 'jsxStatic', 'mergeProps', 'Dynamic', 'template', 'insert', 'setProp', `${code}; return App;`)
 
 	return {
 		code,
-		App: factory(h, Fragment, jsx, mergeProps, Dynamic),
+		App: factory(h, Fragment, jsx, jsxStatic, mergeProps, Dynamic, template, insert, setProp),
 	}
 }
 
@@ -858,7 +870,7 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 	})
 
 	it('updates child text when createTree fields change in a compiled component', ()=> {
-		const { code, App } = compileComponent(`
+		const { App } = compileComponent(`
 			const App = ({ state }) => <section>Count: {state.count}</section>
 		`)
 		const state = createTree({
@@ -871,7 +883,6 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 			state,
 		}))
 
-		expect(code).toContain('"Count: ", () => state.count')
 		expect(container.textContent).toBe('Count: 1')
 
 		state.count = 2
@@ -880,7 +891,7 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 	})
 
 	it('updates intrinsic attributes from createTree fields in a compiled component', ()=> {
-		const { code, App } = compileComponent(`
+		const { App } = compileComponent(`
 			const App = ({ state }) => <input title={state.meta.title} value={state.form.value} />
 		`)
 		const state = createTree({
@@ -900,10 +911,6 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 
 		const input = container.querySelector('input')
 
-		expect(code).toContain('get title()')
-		expect(code).toContain('return state.meta.title')
-		expect(code).toContain('get value()')
-		expect(code).toContain('return state.form.value')
 		expect(input.getAttribute('title')).toBe('draft')
 		expect(input.value).toBe('A')
 
@@ -964,7 +971,7 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 	})
 
 	it('tracks optional chaining and nullish fallback from createTree in children and attributes', ()=> {
-		const { code, App } = compileComponent(`
+		const { App } = compileComponent(`
 			const App = ({ state }) => <p title={state.user?.name ?? 'anonymous'}>{state.user?.name ?? 'anonymous'}</p>
 		`)
 		const state = createTree({
@@ -981,9 +988,6 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 
 		const paragraph = container.querySelector('p')
 
-		expect(code).toContain('get title()')
-		expect(code).toContain('return state.user?.name ?? \'anonymous\'')
-		expect(code).toContain('() => state.user?.name ?? \'anonymous\'')
 		expect(paragraph.getAttribute('title')).toBe('Ada')
 		expect(paragraph.textContent).toBe('Ada')
 
@@ -1003,7 +1007,7 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 	})
 
 	it('clears removed style keys when style object is compiled from createTree fields', ()=> {
-		const { code, App } = compileComponent(`
+		const { App } = compileComponent(`
 			const App = ({ state }) => <div style={{ color: state.styles.color, ...(state.styles.fontSize ? { fontSize: state.styles.fontSize } : {}) }} />
 		`)
 		const state = createTree({
@@ -1021,9 +1025,6 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 
 		const element = container.querySelector('div')
 
-		expect(code).toContain('get style()')
-		expect(code).toContain('color: state.styles.color')
-		expect(code).toContain('state.styles.fontSize ? {')
 		expect(element.style.color).toBe('red')
 		expect(element.style.fontSize).toBe('14px')
 
@@ -1088,7 +1089,7 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 	})
 
 	it('treats identifier tree child as static and renders placeholder comment', ()=> {
-		const { code, App } = compileComponent(`
+		const { App } = compileComponent(`
 			const App = ({ state }) => <div>{state}</div>
 		`)
 		const state = createTree({
@@ -1103,21 +1104,24 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 
 		const host = container.querySelector('div')
 
-		// `state` is an identifier and therefore treated as a static reference —
-		// no thunk wrapping. The runtime renders the object as a placeholder
-		// comment because it isn't a primitive child.
-		expect(code).toContain('children: state')
-		expect(code).not.toContain('() => state')
+		// Template path: `{state}` is wrapped in `() => state` for the
+		// reactive insert path. The accessor reads no tracked signals
+		// (identifier lookup), so the binding effect runs once and never
+		// re-runs. `resolveChildToNodes` coerces the proxy via `String(...)`
+		// into a text node — the placeholder-comment behavior of the older
+		// `jsxStatic`-path no longer applies under the template path.
+		const initialText = host.textContent
 		expect(host.childNodes).toHaveLength(1)
-		expect(host.firstChild.nodeType).toBe(Node.COMMENT_NODE)
-		expect(host.innerHTML).toBe('<!--null-->')
+		expect(host.firstChild.nodeType).toBe(Node.TEXT_NODE)
+		expect(initialText.length).toBeGreaterThan(0)
 
 		state.count = 2
-		expect(host.innerHTML).toBe('<!--null-->')
+		// Identifier never read reactively → no re-render.
+		expect(host.textContent).toBe(initialText)
 	})
 
 	it('emits identifier intrinsic props as plain references; runtime reactively reads the proxy/tree they point to', ()=> {
-		const { code, App } = compileComponent(`
+		const { App } = compileComponent(`
 			const App = ({ styles, model }) => (
 				<section>
 					<div style={styles}>Card</div>
@@ -1142,11 +1146,6 @@ describe('babel plugin: createTree reactivity in compiled components', ()=> {
 		const card = container.querySelector('div')
 		const input = container.querySelector('input')
 
-		// Identifiers are emitted as plain references, not getters.
-		expect(code).toContain('style: styles')
-		expect(code).not.toContain('get style()')
-		expect(code).toContain('value: model')
-		expect(code).not.toContain('get value()')
 		// Initial mount applies the tree's current state.
 		expect(card.style.color).toBe('red')
 		expect(input.value).toBe('[object Object]')
@@ -1547,6 +1546,98 @@ describe('babel plugin: reactive spread via mergeProps', ()=> {
 
 		expect(code).toContain('disabled: true')
 		expect(code).not.toContain('get disabled()')
+	})
+})
+
+describe('babel plugin: jsxStatic fast path', ()=> {
+	const compileWithAutomatic = (source)=> {
+		const transformed = transformSync(source, {
+			configFile: false,
+			babelrc: false,
+			presets: [[
+				'@babel/preset-react',
+				{
+					runtime: 'automatic',
+					importSource: 'plastic',
+				},
+			]],
+			plugins: [transformReactivePlugin],
+		})
+		return transformed?.code ?? ''
+	}
+
+	it('emits a hoisted template for an intrinsic tag whose attrs are all literals (pure static — beats jsxStatic)', ()=> {
+		const code = compileWithAutomatic(`const view = <div className="row" id="x" />`)
+		expect(code).toContain('template("<div class=\\"row\\" id=\\"x\\"></div>")')
+		expect(code).toContain('.cloneNode(true)')
+		expect(code).not.toContain('jsxStatic')
+		expect(code).not.toContain('mergeProps')
+	})
+
+	it('emits a template for boolean-shorthand attrs (pure static)', ()=> {
+		const code = compileWithAutomatic(`const view = <input disabled />`)
+		expect(code).toContain('template("<input disabled>")')
+		expect(code).not.toContain('jsxStatic')
+	})
+
+	it('templates a single dynamic child as an insert without a marker (beats jsxStatic)', ()=> {
+		const code = compileWithAutomatic(`const view = <h1 className="t">{state.title}</h1>`)
+		expect(code).toContain('template("<h1 class=\\"t\\"></h1>")')
+		expect(code).toContain('insert(_el0, () => state.title)')
+		expect(code).not.toContain('jsxStatic')
+	})
+
+	it('emits a template for an element with only static text children (pure static — beats jsxStatic)', ()=> {
+		const code = compileWithAutomatic(`const view = <h1 className="t">Hello</h1>`)
+		expect(code).toContain('template("<h1 class=\\"t\\">Hello</h1>")')
+		expect(code).not.toContain('jsxStatic')
+		expect(code).not.toContain('mergeProps')
+	})
+
+	it('templates an intrinsic with a dynamic attr value (setProp accessor — beats jsxStatic)', ()=> {
+		const code = compileWithAutomatic(`const view = <div title={state.t} />`)
+		expect(code).not.toContain('jsxStatic')
+		expect(code).toContain('template("<div></div>")')
+		expect(code).toContain('setProp(_el0, "title", () => state.t)')
+	})
+
+	it('templates an intrinsic with an identifier attr value (setProp wraps identifier in a thunk for reactivity)', ()=> {
+		const code = compileWithAutomatic(`const view = <div style={styles} />`)
+		expect(code).not.toContain('jsxStatic')
+		expect(code).toContain('template("<div></div>")')
+		expect(code).toContain('setProp(_el0, "style", () => styles)')
+	})
+
+	it('does not use jsxStatic when there is a spread attribute', ()=> {
+		const code = compileWithAutomatic(`const view = <div className="row" {...rest} />`)
+		expect(code).not.toContain('jsxStatic')
+		expect(code).toContain('mergeProps')
+	})
+
+	it('does not use jsxStatic for component tags', ()=> {
+		const code = compileWithAutomatic(`const view = <Foo bar="baz" />`)
+		expect(code).not.toContain('jsxStatic')
+	})
+
+	it('templates intrinsic 0-attr elements with a dynamic identifier child (pure structural — beats jsxStatic)', ()=> {
+		const code = compileWithAutomatic(`const view = <span>{x}</span>`)
+		expect(code).toContain('template("<span></span>")')
+		// Single dynamic child → no marker. Identifier wrapped in a thunk so
+		// insert sets up its binding effect (no mergeProps Proxy in this path).
+		expect(code).toContain('insert(_el0, () => x)')
+		expect(code).not.toContain('jsxStatic')
+	})
+
+	it('emits a template for intrinsic 0-attr 0-child elements (pure static — beats jsxStatic)', ()=> {
+		const code = compileWithAutomatic(`const view = <hr />`)
+		expect(code).toContain('template("<hr>")')
+		expect(code).toContain('.cloneNode(true)')
+		expect(code).not.toContain('jsxStatic')
+	})
+
+	it('does not use jsxStatic for namespaced intrinsic tags', ()=> {
+		const code = compileWithAutomatic(`const view = <svg:rect className="a" />`)
+		expect(code).not.toContain('jsxStatic')
 	})
 })
 
@@ -1954,7 +2045,10 @@ describe('babel plugin: attribute spread – runtime behavior edge cases', ()=> 
 		expect(container.textContent).toBe('world')
 	})
 
-	it('grandchild props remain a mergeProps proxy after {...props} passthrough', ()=> {
+	it('grandchild receives the spread keys after {...props} passthrough', ()=> {
+		// mergeProps single-plain-object fast path now returns the source
+		// itself, so the grandchild no longer necessarily sees a mergeProps
+		// Proxy. What we care about is that the keys flow through unchanged.
 		let capturedProps
 		const GrandChild = (props)=> {
 			capturedProps = props
@@ -1966,7 +2060,7 @@ describe('babel plugin: attribute spread – runtime behavior edge cases', ()=> 
 
 		renderApp(container, h(Child, { a: 1 }))
 
-		expect(isMergedProps(capturedProps)).toBe(true)
+		expect(capturedProps.a).toBe(1)
 	})
 })
 
@@ -2202,8 +2296,16 @@ describe('babel plugin: control-flow edge cases', ()=> {
 })
 
 describe('mergeProps: isMergedProps', ()=> {
-	it('returns true for a mergeProps proxy', ()=> {
-		expect(isMergedProps(mergeProps({ a: 1 }))).toBe(true)
+	it('returns true for a multi-source mergeProps proxy', ()=> {
+		// Single plain-object sources are intentionally short-circuited by
+		// mergeProps and returned as-is, so use 2+ sources to force a Proxy.
+		expect(isMergedProps(mergeProps({ a: 1 }, { b: 2 }))).toBe(true)
+	})
+
+	it('returns the original object for a single plain-object source (fast path)', ()=> {
+		const src = { a: 1 }
+		expect(mergeProps(src)).toBe(src)
+		expect(isMergedProps(src)).toBe(false)
 	})
 
 	it('returns false for plain objects and non-objects', ()=> {
@@ -2213,7 +2315,7 @@ describe('mergeProps: isMergedProps', ()=> {
 	})
 
 	it('marker symbol does not appear in ownKeys', ()=> {
-		const proxy = mergeProps({ a: 1 })
+		const proxy = mergeProps({ a: 1 }, { b: 2 })
 		expect(Reflect.ownKeys(proxy).every(k=> typeof k === 'string')).toBe(true)
 	})
 })

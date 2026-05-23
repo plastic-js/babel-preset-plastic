@@ -236,16 +236,125 @@ build error:
 jsx(Fragment, { children: [...] })
 ```
 
+#### Compile-time fast paths
+
+The reactive plugin probes each `JSXElement` against two optimizations before
+falling back to the generic `jsx(Tag, mergeProps(...))` form. They cascade —
+the template path is tried first, then `jsxStatic`, then the generic path.
+
+##### 1. Template / `cloneNode` path (foldable subtrees)
+
+A JSX subtree built from intrinsic tags with plain attribute names can be
+serialized to an HTML string at build time. The runtime parses that string
+once per module into a hoisted `<template>` element, and each render site
+clones it instead of running `createElement` / `setAttribute` / `appendChild`
+node-by-node.
+
+A `JSXElement` is **foldable** when:
+
+- The tag is a lowercase `JSXIdentifier` (intrinsic DOM tag).
+- It has no `JSXSpreadAttribute`s.
+- Every attribute name is a plain `JSXIdentifier` (no `xlink:href`-style
+  `JSXNamespacedName` keys).
+
+Attribute *values* and *children* are unrestricted — literals fold into the
+HTML; dynamic expressions become "holes" patched at mount. Non-foldable
+children (components, fragments, spread children, elements with spreads or
+namespaced attrs) become `insert` holes whose JSX is re-traversed by Babel and
+handled by the normal `jsx` pipeline.
+
+The pass fires only at the **topmost** foldable element; nested foldable
+descendants get folded into the same template during `compileTemplatePlan`.
+
+Three output shapes, depending on the plan:
+
+- **Pure-static subtree** (zero dynamic holes) — replaced inline with a single
+  expression, no IIFE:
+  ```jsx
+  // Source
+  <div class="card">
+    <h1>Hello</h1>
+    <p>Welcome</p>
+  </div>
+
+  // Output (template hoisted to module scope)
+  _tmpl$1.cloneNode(true)
+  ```
+
+- **Mixed static + dynamic** — wrapped in an IIFE that clones the template,
+  declares locals via pre-computed DOM navigation (`firstChild`/`nextSibling`),
+  patches holes, and returns the root. Each "local" is a const binding for a
+  cloned node the patching code needs to touch. Each non-root local is
+  declared by navigating from its **nearest already-declared ancestor** to
+  keep navigation chains short:
+  ```jsx
+  // Source
+  <p>Welcome, {name}</p>
+
+  // Output
+  (() => {
+    const _el0 = _tmpl$1.cloneNode(true)
+    const _el1 = _el0.firstChild.nextSibling   // the `<!>` marker
+    insert(_el0, () => name, _el1)
+    return _el0
+  })()
+  ```
+
+- **Dynamic attribute holes** — emit `setProp(el, key, accessor)` calls in
+  addition to (or instead of) `insert` calls.
+
+`className` and `htmlFor` are rewritten to `class` and `for` when baked into
+the HTML string. Whitespace-sensitive tags (`<pre>`, `<textarea>`, `<code>`,
+`<script>`, `<style>`) preserve raw text inside the template; all other tags
+collapse `JSXText` whitespace to single spaces. Void elements (`<br>`,
+`<img>`, etc.) are serialized without a closing tag. Identical template HTML
+across the file is deduplicated to a single hoisted node.
+
+Dynamic-child holes use a `<!>` comment marker for position anchoring unless
+the dynamic expression is the only meaningful child of its parent, in which
+case the marker is omitted and `insert(parent, accessor)` is called without
+an anchor.
+
+##### 2. `jsxStatic` path (single intrinsic element, all-literal attrs)
+
+When an element is not foldable as a subtree but its own attributes are all
+literal-static, the plugin emits `jsxStatic(tag, propsLiteral, children?)`.
+The runtime applies the props object directly with no reactive getters or
+`mergeProps` overhead. Children still flow through the normal `jsx` pipeline
+— they may themselves be reactive expressions or further `jsx(...)` subtrees.
+
+```jsx
+// Source
+<div id="root" class="page">{dynamicChild}</div>
+
+// Output (children are not all literal, so subtree isn't foldable here)
+jsxStatic('div', { id: 'root', class: 'page' }, dynamicChild)
+```
+
+Qualifies when:
+
+- Tag is a lowercase `JSXIdentifier`.
+- No `JSXSpreadAttribute`s.
+- Every attribute value is a literal (string / numeric / boolean / null /
+  bare boolean attr).
+
+A single meaningful child is passed positionally; multiple children are
+passed as an array.
+
 ## Runtime contract
 
-Emitted code imports `jsx`, `Fragment`, and `mergeProps` from
-`@plastic-js/plastic/jsx-runtime`. The host project must provide that module:
+Emitted code imports from `@plastic-js/plastic/jsx-runtime`. The host project
+must provide that module:
 
 | Export | Purpose |
 |---|---|
 | `jsx` | `jsx(Tag, props)` — creates the element / component instance. |
 | `mergeProps` | Proxy-based prop merger that observes signal reads via getters. |
 | `Fragment` | Marker tag for `<>…</>`. |
+| `jsxStatic` | `jsxStatic(tag, props, children?)` — non-reactive prop application for the all-literal-attrs fast path. |
+| `template` | `template(htmlString)` — parses the HTML once and returns a node to `cloneNode(true)`. |
+| `setProp` | `setProp(el, key, accessor)` — reactive attribute patcher for template holes. |
+| `insert` | `insert(parent, accessor, marker?)` — reactive child inserter for template holes; uses the optional marker as a positional anchor. |
 
 Components consumed by the control-flow output additionally need:
 
