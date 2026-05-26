@@ -1,6 +1,6 @@
 {
   "name": "@plastic-js/babel-preset-plastic",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "description": "Babel preset that transforms JSX into Plastic's reactive runtime calls (control-flow lifting + mergeProps rewrite).",
   "type": "module",
   "main": "./index.js",
