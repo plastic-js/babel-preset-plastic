@@ -578,19 +578,32 @@ const plugin = function(babel){
 			const singleChild = meaningful.length === 1
 
 			let domIdx = 0
+			// Adjacent text children must be coalesced into a single text node,
+			// because the HTML parser merges runs of text when the template is
+			// fed through innerHTML. If we kept them as separate plan entries,
+			// the compile-time child indices would diverge from the runtime DOM
+			// and walker paths would land on the wrong node.
+			const pushText = (text)=> {
+				const last = node.children[node.children.length - 1]
+				if (last && last.kind === 'text'){
+					last.text += text
+					return
+				}
+				node.children.push({
+					kind: 'text',
+					text,
+					parent: node,
+					indexInParent: domIdx,
+					children: [],
+					needsLocal: false,
+					localName: null,
+				})
+				domIdx += 1
+			}
 			for (const child of meaningful){
 				if (t.isJSXText(child)){
 					const raw = WHITESPACE_SENSITIVE_TAGS.has(tag) ? child.value : normalizeJsxText(child.value)
-					node.children.push({
-						kind: 'text',
-						text: raw,
-						parent: node,
-						indexInParent: domIdx,
-						children: [],
-						needsLocal: false,
-						localName: null,
-					})
-					domIdx += 1
+					pushText(raw)
 					continue
 				}
 				if (t.isJSXExpressionContainer(child)){
@@ -604,16 +617,7 @@ const plugin = function(babel){
 						if (v == null || v === false || v === true){
 							continue
 						}
-						node.children.push({
-							kind: 'text',
-							text: String(v),
-							parent: node,
-							indexInParent: domIdx,
-							children: [],
-							needsLocal: false,
-							localName: null,
-						})
-						domIdx += 1
+						pushText(String(v))
 						continue
 					}
 					// Dynamic child hole.

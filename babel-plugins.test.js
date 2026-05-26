@@ -2319,3 +2319,113 @@ describe('mergeProps: isMergedProps', ()=> {
 		expect(Reflect.ownKeys(proxy).every(k=> typeof k === 'string')).toBe(true)
 	})
 })
+
+describe('babel plugin: adjacent text children coalesce in template plan', ()=> {
+	afterEach(()=> {
+		document.body.innerHTML = ''
+	})
+
+	it('places dynamic holes into the correct element when JSX text is split by a {" "} literal', ()=> {
+		// Repro: prior to the fix, each {' '} bumped the compile-time
+		// child index, but the HTML parser merged the adjacent runs of
+		// text into a single text node, so walker paths landed on a
+		// text node instead of the intended <strong>.
+		const { App } = compileComponent(`
+			const App = ({ state }) => (
+				<p>
+					className is{' '}
+					<strong>{state.a}</strong>
+					. Style mode is{' '}
+					<strong>{state.b}</strong>.
+				</p>
+			)
+		`)
+		const state = createTree({ a: 'A1', b: 'B1' })
+		const container = document.createElement('div')
+		document.body.appendChild(container)
+
+		renderApp(container, h(App, { state }))
+
+		const strongs = container.querySelectorAll('strong')
+		expect(strongs.length).toBe(2)
+		expect(strongs[0].textContent).toBe('A1')
+		expect(strongs[1].textContent).toBe('B1')
+
+		state.a = 'A2'
+		state.b = 'B2'
+
+		expect(strongs[0].textContent).toBe('A2')
+		expect(strongs[1].textContent).toBe('B2')
+	})
+
+	it('resolves an element walker correctly when adjacent string-literal children precede it', ()=> {
+		const { App } = compileComponent(`
+			const App = ({ state }) => <div>{'a'}{'b'}<span>{state.x}</span>{'c'}</div>
+		`)
+		const state = createTree({ x: 'X1' })
+		const container = document.createElement('div')
+		document.body.appendChild(container)
+
+		renderApp(container, h(App, { state }))
+
+		expect(container.textContent).toBe('abX1c')
+		const span = container.querySelector('span')
+		expect(span.textContent).toBe('X1')
+
+		state.x = 'X2'
+		expect(span.textContent).toBe('X2')
+		expect(container.textContent).toBe('abX2c')
+	})
+
+	it('handles JSX text plus {" "} around a dynamic hole (marker boundary)', ()=> {
+		const { App } = compileComponent(`
+			const App = ({ state }) => <p>hello{' '}{state.x}{' '}world</p>
+		`)
+		const state = createTree({ x: 'X1' })
+		const container = document.createElement('div')
+		document.body.appendChild(container)
+
+		renderApp(container, h(App, { state }))
+
+		expect(container.textContent).toBe('hello X1 world')
+
+		state.x = 'X2'
+		expect(container.textContent).toBe('hello X2 world')
+	})
+
+	it('preserves whitespace inside <pre> while still coalescing adjacent text children', ()=> {
+		const { App } = compileComponent(`
+			const App = ({ state }) => <pre>{'a  b'}{'  c'}<span>{state.x}</span></pre>
+		`)
+		const state = createTree({ x: 'X1' })
+		const container = document.createElement('div')
+		document.body.appendChild(container)
+
+		renderApp(container, h(App, { state }))
+
+		const pre = container.querySelector('pre')
+		const span = pre.querySelector('span')
+		expect(span.textContent).toBe('X1')
+		// Leading text run preserves its runs of internal whitespace
+		// (the whitespace-sensitive branch skips normalizeJsxText) and
+		// coalesces adjacent text-emitting children into a single node.
+		expect(pre.firstChild.nodeType).toBe(3)
+		expect(pre.firstChild.textContent).toBe('a  b  c')
+	})
+
+	it('round-trips a pure-static subtree of adjacent text children through innerHTML', ()=> {
+		const { App } = compileComponent(`
+			const App = () => <p>hello{' '}world{'!'}</p>
+		`)
+		const container = document.createElement('div')
+		document.body.appendChild(container)
+
+		renderApp(container, h(App, {}))
+
+		const p = container.querySelector('p')
+		// A single coalesced text node — what innerHTML produces.
+		expect(p.childNodes.length).toBe(1)
+		expect(p.firstChild.nodeType).toBe(3)
+		expect(p.textContent).toBe('hello world!')
+	})
+})
