@@ -40,19 +40,10 @@
   "publishConfig": {
     "access": "public"
   },
-  "peerDependencies": {
-    "@babel/core": "^7.0.0",
-    "@babel/preset-react": "^7.0.0"
-  },
-  "peerDependenciesMeta": {
-    "@babel/preset-react": {
-      "optional": true
-    }
-  },
   "devDependencies": {
     "@babel/core": "^7.29.0",
     "@babel/preset-react": "^7.28.5",
-    "@plastic-js/plastic": "^1.0.4",
+    "@plastic-js/plastic": "^1.0.5",
     "jsdom": "^29.1.1",
     "vitest": "^4.1.7"
   }
