@@ -907,6 +907,78 @@ const plugin = function(babel){
 		return t.identifier(String(name))
 	}
 
+	// ---------------------------------------------------------------------------
+	// Dev-only component marker
+	//
+	// When enabled (via the `componentMarker` plugin option — the preset turns it
+	// on outside production), the topmost intrinsic element a component returns is
+	// stamped with `data-comp="<ComponentName>"` so component boundaries are
+	// visible in the DOM inspector. The attribute is injected into the JSX *before*
+	// the emit paths below run, so it folds into the static template HTML (zero
+	// runtime cost) for foldable roots and rides the normal props path otherwise.
+	// ---------------------------------------------------------------------------
+
+	// Derive a component's display name from its function path. Components follow
+	// the JSX convention of an uppercase-initial name; lowercase helpers and
+	// intrinsic-returning utilities are intentionally skipped.
+	const componentNameOf = (fnPath)=> {
+		const fn = fnPath.node
+		if ((t.isFunctionDeclaration(fn) || t.isFunctionExpression(fn)) && fn.id){
+			return fn.id.name
+		}
+		const parent = fnPath.parentPath
+		if (parent?.isVariableDeclarator() && t.isIdentifier(parent.node.id)){
+			return parent.node.id.name
+		}
+		if (parent?.isAssignmentExpression() && t.isIdentifier(parent.node.left)){
+			return parent.node.left.name
+		}
+		if (parent?.isObjectProperty() && !parent.node.computed && t.isIdentifier(parent.node.key)){
+			return parent.node.key.name
+		}
+		return null
+	}
+
+	// True when `path` (a JSXElement) is the element a function returns directly —
+	// either an arrow's expression body (`() => <div/>`) or the argument of a
+	// `return`. Parentheses don't create AST nodes, so `return (\n<div/>\n)` and
+	// `() => (\n<div/>\n)` both land here.
+	const isReturnPositionOf = (path, fnPath)=> {
+		const parent = path.parentPath
+		if (!parent){
+			return false
+		}
+		if (parent.node === fnPath.node && path.key === 'body'){
+			return true
+		}
+		if (parent.isReturnStatement() && parent.getFunctionParent()?.node === fnPath.node){
+			return true
+		}
+		return false
+	}
+
+	// Resolve the component name to stamp on `path` if it is a component's root
+	// intrinsic element, else null. Only intrinsic (lowercase) tags qualify — a
+	// component root (`<Child/>`) would receive `data-comp` as a prop, not a DOM
+	// attribute, so those are skipped (the inner component stamps its own root).
+	const componentRootName = (path)=> {
+		const opening = path.node.openingElement
+		if (!t.isJSXIdentifier(opening.name) || !(/^[a-z]/).test(opening.name.name)){
+			return null
+		}
+		const fnPath = path.getFunctionParent()
+		if (!fnPath || !isReturnPositionOf(path, fnPath)){
+			return null
+		}
+		const name = componentNameOf(fnPath)
+		if (!name || !(/^[A-Z]/).test(name)){
+			return null
+		}
+		return name
+	}
+
+	const hasDataCompAttr = (attrs)=> attrs.some(attr=> t.isJSXAttribute(attr) && t.isJSXIdentifier(attr.name, { name: 'data-comp' }))
+
 	return {
 		name: 'transform-jsx-reactive',
 		visitor: {
@@ -920,6 +992,17 @@ const plugin = function(babel){
 				const opening = node.openingElement
 				const attrs = opening.attributes
 				const children = node.children
+
+				// Dev-only: stamp a component's root intrinsic element with
+				// `data-comp="<ComponentName>"`. Done up front so the attribute is
+				// present when the foldable / static / mergeProps emit paths below
+				// consume `attrs`.
+				if (state.opts?.componentMarker === true){
+					const compName = componentRootName(path)
+					if (compName && !hasDataCompAttr(attrs)){
+						attrs.push(t.jsxAttribute(t.jsxIdentifier('data-comp'), t.stringLiteral(compName)))
+					}
+				}
 
 				const tagExpr = jsxTagToExpression(opening.name)
 				const parentTagName = t.isJSXIdentifier(opening.name) ? opening.name.name : null

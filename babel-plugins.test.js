@@ -2429,3 +2429,117 @@ describe('babel plugin: adjacent text children coalesce in template plan', ()=> 
 		expect(p.textContent).toBe('hello world!')
 	})
 })
+
+// Same as compileComponent but with the dev-only component marker enabled, so
+// the topmost intrinsic element a component returns is stamped with
+// `data-comp="<ComponentName>"`.
+const compileWithMarker = (source)=> {
+	const transformed = transformSync(source, {
+		configFile: false,
+		babelrc: false,
+		sourceType: 'script',
+		presets: [[
+			'@babel/preset-react',
+			{
+				runtime: 'classic',
+				pragma: 'h',
+				pragmaFrag: 'Fragment',
+			},
+		]],
+		plugins: [[transformReactivePlugin, { componentMarker: true }]],
+	})
+
+	const code = transformed?.code ?? ''
+	const factory = new Function('h', 'Fragment', 'jsx', 'jsxStatic', 'mergeProps', 'Dynamic', 'template', 'insert', 'setProp', `${code}; return App;`)
+
+	return {
+		code,
+		App: factory(h, Fragment, jsx, jsxStatic, mergeProps, Dynamic, template, insert, setProp),
+	}
+}
+
+describe('babel plugin: dev-only component marker', ()=> {
+	afterEach(()=> {
+		document.body.innerHTML = ''
+	})
+
+	it('stamps the root intrinsic element with data-comp on a pure-static component', ()=> {
+		const { code, App } = compileWithMarker(`
+			const App = () => <section class="card">hi</section>
+		`)
+
+		// Folded into the template HTML — zero runtime cost.
+		expect(code).toMatch(/data-comp=\\?"App\\?"/)
+
+		const container = document.createElement('div')
+		document.body.appendChild(container)
+		renderApp(container, h(App, {}))
+
+		const section = container.querySelector('section')
+		expect(section.getAttribute('data-comp')).toBe('App')
+		expect(section.getAttribute('class')).toBe('card')
+	})
+
+	it('stamps a thunk-compiled component (dynamic children) on the real root', ()=> {
+		const { code, App } = compileWithMarker(`
+			const Child = () => <span>child</span>
+			const App = ({ state }) => (
+				<header className={state.cls}>
+					<Child />
+					{state.label}
+				</header>
+			)
+		`)
+
+		// data-comp is a literal attr, so it folds into the template HTML even
+		// though the component compiles to a render thunk for its dynamic holes.
+		expect(code).toMatch(/data-comp=\\?"App\\?"/)
+
+		const state = createTree({ cls: 'top', label: 'x' })
+		const container = document.createElement('div')
+		document.body.appendChild(container)
+		renderApp(container, h(App, { state }))
+
+		const header = container.querySelector('header')
+		expect(header.getAttribute('data-comp')).toBe('App')
+		expect(header.getAttribute('class')).toBe('top')
+		// the inner component stamps its own root independently
+		expect(container.querySelector('span').getAttribute('data-comp')).toBe('Child')
+	})
+
+	it('does not stamp lowercase (non-component) functions', ()=> {
+		const { code } = compileWithMarker(`
+			const App = () => null
+			const view = () => <section>hi</section>
+		`)
+		expect(code).not.toContain('data-comp')
+	})
+
+	it('does not stamp when the component root is itself a component', ()=> {
+		const { code } = compileWithMarker(`
+			const App = () => <Child foo="bar" />
+		`)
+		// Would otherwise become a `data-comp` prop on Child, not a DOM attribute.
+		expect(code).not.toContain('data-comp')
+	})
+
+	it('stamps function-declaration components and respects an existing data-comp', ()=> {
+		const declared = compileWithMarker(`
+			function App() { return <div>x</div> }
+		`)
+		expect(declared.code).toMatch(/data-comp=\\?"App\\?"/)
+
+		const preset = compileWithMarker(`
+			const App = () => <div data-comp="Custom">x</div>
+		`)
+		expect(preset.code).toMatch(/data-comp=\\?"Custom\\?"/)
+		expect(preset.code).not.toMatch(/data-comp=\\?"App\\?"/)
+	})
+
+	it('is off by default (no option) so production output is unaffected', ()=> {
+		const { code } = compileComponent(`
+			const App = () => <section>hi</section>
+		`)
+		expect(code).not.toContain('data-comp')
+	})
+})
